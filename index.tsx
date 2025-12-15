@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type, Schema, Part } from "@google/genai";
 import * as mammoth from "mammoth";
 import ReactMarkdown from "react-markdown";
+import { useDatabase } from './src/useDatabase';
 
 // --- Types ---
 
@@ -731,12 +732,15 @@ const SettingsModal = ({ show, onClose, settings, setSettings }: { show: boolean
 };
 
 // ... Logs and Trash Modals remain similar, simplified for brevity ...
-const Modals = ({ 
-    showLogs, setShowLogs, showTrash, setShowTrash, trashItems, restoreSession, permanentDeleteSession 
+const Modals = ({
+    showLogs, setShowLogs, showTrash, setShowTrash, trashItems, restoreSession, permanentDeleteSession, getLogs
 }: any) => {
-    // Reusing the logic from previous step, ensuring logs and trash are displayed
     const [logs, setLogs] = useState<LogEntry[]>([]);
-    useEffect(() => { if(showLogs) setLogs(JSON.parse(localStorage.getItem('jurispanel_logs') || "[]")); }, [showLogs]);
+    useEffect(() => {
+        if(showLogs) {
+            getLogs().then((loadedLogs: LogEntry[]) => setLogs(loadedLogs));
+        }
+    }, [showLogs, getLogs]);
 
     if(showLogs) return (
          <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center backdrop-blur-sm" onClick={() => setShowLogs(false)}>
@@ -1318,22 +1322,35 @@ const App = () => {
     const [trashItems, setTrashItems] = useState<SavedSession[]>([]);
     const [selectedBatchIds, setSelectedBatchIds] = useState<Set<string>>(new Set());
 
+    const db = useDatabase();
+
+    const logAction = useCallback(async (action: string, details: string, targetId?: string) => {
+        const log = addSystemLog(action, details, targetId);
+        await db.saveLog(log);
+    }, [db]);
+
     // Load data on mount
     useEffect(() => {
-        try {
-            const saved = localStorage.getItem('jurispanel_sessions');
-            if (saved) setSavedSessions(JSON.parse(saved));
-            const trash = localStorage.getItem('jurispanel_trash');
-            if (trash) setTrashItems(JSON.parse(trash));
-            const s = localStorage.getItem('jurispanel_settings');
-            if (s) setSettings(JSON.parse(s));
-        } catch(e) { console.error("Error loading local storage", e); }
-    }, []);
+        const loadData = async () => {
+            try {
+                const sessions = await db.getSessions();
+                setSavedSessions(sessions);
+
+                const trash = localStorage.getItem('jurispanel_trash');
+                if (trash) setTrashItems(JSON.parse(trash));
+                const s = localStorage.getItem('jurispanel_settings');
+                if (s) setSettings(JSON.parse(s));
+            } catch(e) {
+                console.error("Error loading data", e);
+            }
+        };
+        loadData();
+    }, [db]);
 
     // Handlers
     const toggleView = () => setCurrentView(v => v === 'dashboard' ? 'report' : 'dashboard');
     
-    const handleSaveSession = () => {
+    const handleSaveSession = async () => {
         if (!metadata || cases.length === 0) return;
         const id = sessionId || getNextId('L');
         const session: SavedSession = {
@@ -1342,59 +1359,56 @@ const App = () => {
             cases,
             dateSaved: Date.now()
         };
-        
-        // Update or add
-        const existingIdx = savedSessions.findIndex(s => s.id === id);
-        let newSessions = [...savedSessions];
-        if (existingIdx >= 0) {
-            newSessions[existingIdx] = session;
+
+        const success = await db.saveSession(session);
+        if (success) {
+            const updatedSessions = await db.getSessions();
+            setSavedSessions(updatedSessions);
+            setSessionId(id);
+            await logAction("Sessão Salva", `Sessão ${id} salva com ${cases.length} processos`);
+            alert("Sessão salva com sucesso!");
         } else {
-            newSessions = [session, ...newSessions];
+            alert("Erro ao salvar sessão. Tente novamente.");
         }
-        
-        setSavedSessions(newSessions);
-        setSessionId(id);
-        localStorage.setItem('jurispanel_sessions', JSON.stringify(newSessions));
-        addSystemLog("Sessão Salva", `Sessão ${id} salva com ${cases.length} processos`);
-        alert("Sessão salva com sucesso!");
     };
 
-    const handleLoadSession = (s: SavedSession) => {
+    const handleLoadSession = async (s: SavedSession) => {
         setMetadata(s.metadata);
         setCases(s.cases);
         setSessionId(s.id);
-        addSystemLog("Sessão Carregada", `Sessão ${s.id} carregada`);
+        await logAction("Sessão Carregada", `Sessão ${s.id} carregada`);
     };
 
-    const handleDeleteSession = (id: string) => {
+    const handleDeleteSession = async (id: string) => {
         const session = savedSessions.find(s => s.id === id);
         if (session) {
             const newTrash = [session, ...trashItems];
             setTrashItems(newTrash);
             localStorage.setItem('jurispanel_trash', JSON.stringify(newTrash));
-            
-            const newSaved = savedSessions.filter(s => s.id !== id);
-            setSavedSessions(newSaved);
-            localStorage.setItem('jurispanel_sessions', JSON.stringify(newSaved));
-            addSystemLog("Sessão Movida para Lixeira", `Sessão ${id}`);
+
+            await db.deleteSession(id);
+            const updatedSessions = await db.getSessions();
+            setSavedSessions(updatedSessions);
+            await logAction("Sessão Movida para Lixeira", `Sessão ${id}`);
         }
     };
 
-    const handleRestoreSession = (s: SavedSession) => {
-        setSavedSessions([s, ...savedSessions]);
-        localStorage.setItem('jurispanel_sessions', JSON.stringify([s, ...savedSessions]));
-        
+    const handleRestoreSession = async (s: SavedSession) => {
+        await db.saveSession(s);
+        const updatedSessions = await db.getSessions();
+        setSavedSessions(updatedSessions);
+
         const newTrash = trashItems.filter(t => t.id !== s.id);
         setTrashItems(newTrash);
         localStorage.setItem('jurispanel_trash', JSON.stringify(newTrash));
-        addSystemLog("Sessão Restaurada", `Sessão ${s.id}`);
+        await logAction("Sessão Restaurada", `Sessão ${s.id}`);
     };
 
-    const handlePermanentDelete = (id: string) => {
+    const handlePermanentDelete = async (id: string) => {
         const newTrash = trashItems.filter(t => t.id !== id);
         setTrashItems(newTrash);
         localStorage.setItem('jurispanel_trash', JSON.stringify(newTrash));
-        addSystemLog("Sessão Excluída Permanentemente", `Sessão ${id}`);
+        await logAction("Sessão Excluída Permanentemente", `Sessão ${id}`);
     };
 
     const handleProcess = async (payload: ContentPayload, meta: SessionMetadata) => {
@@ -1403,7 +1417,15 @@ const App = () => {
         setProgress(10);
         setEstimatedTime("Iniciando...");
         setProgressMessage("Enviando documento para análise...");
-        
+
+        await db.saveDocument(
+            payload.filename || 'documento.txt',
+            payload.mimeType || 'text/plain',
+            payload.data,
+            payload.data.length,
+            sessionId || undefined
+        );
+
         try {
             const ai = getAIClient();
             
@@ -1642,12 +1664,13 @@ const App = () => {
             <AIStatusBadge settings={settings} onOpenSettings={() => setShowSettings(true)} />
 
             <SettingsModal show={showSettings} onClose={() => setShowSettings(false)} settings={settings} setSettings={setSettings} />
-            <Modals 
-                showLogs={showLogs} setShowLogs={setShowLogs} 
-                showTrash={showTrash} setShowTrash={setShowTrash} 
-                trashItems={trashItems} 
-                restoreSession={handleRestoreSession} 
-                permanentDeleteSession={handlePermanentDelete} 
+            <Modals
+                showLogs={showLogs} setShowLogs={setShowLogs}
+                showTrash={showTrash} setShowTrash={setShowTrash}
+                trashItems={trashItems}
+                restoreSession={handleRestoreSession}
+                permanentDeleteSession={handlePermanentDelete}
+                getLogs={db.getLogs} 
             />
         </div>
     );
